@@ -33,8 +33,14 @@ end
 sysbench.cmdline.options = {
    table_size =
       {"Number of rows per table", 10000},
+  fill_table_size =
+     {"Number of rows per table to fill", 0},
+   start_index =
+      {"Starting index of the row", 1},
    range_size =
       {"Range size for range SELECT queries", 100},
+   create_tables =
+     {"Whether to create table", true},
    tables =
       {"Number of tables", 1},
    point_selects =
@@ -81,6 +87,7 @@ sysbench.cmdline.options = {
 function cmd_prepare()
    local drv = sysbench.sql.driver()
    local con = drv:connect()
+   con:query("SET STATEMENT_TIMEOUT TO '12000s'")
 
    for i = sysbench.tid % sysbench.opt.threads + 1, sysbench.opt.tables,
    sysbench.opt.threads do
@@ -185,17 +192,17 @@ function create_table(drv, con, table_num)
    print(string.format("Creating table 'sbtest%d'...", table_num))
 
    query = string.format([[
-CREATE TABLE sbtest%d(
+CREATE TABLE IF NOT EXISTS  sbtest%d(
   id %s,
-  k INTEGER DEFAULT '0' NOT NULL,
-  c CHAR(120) DEFAULT '' NOT NULL,
-  pad CHAR(60) DEFAULT '' NOT NULL,
+  k INTEGER DEFAULT 0 NOT NULL,
+  c VARCHAR(120) DEFAULT '' NOT NULL,
+  pad VARCHAR(60) DEFAULT '' NOT NULL,
   %s (id)
 ) %s %s]],
       table_num, id_def, id_index_def, engine_def, extra_table_options)
-
+   if sysbench.opt.create_tables then
    con:query(query)
-
+   end
    if (sysbench.opt.table_size > 0) then
       print(string.format("Inserting %d records into 'sbtest%d'",
                           sysbench.opt.table_size, table_num))
@@ -207,12 +214,19 @@ CREATE TABLE sbtest%d(
       query = "INSERT INTO sbtest" .. table_num .. "(id, k, c, pad) VALUES"
    end
 
-   con:bulk_insert_init(query)
-
    local c_val
    local pad_val
-
-   for i = 1, sysbench.opt.table_size do
+   start_index = sysbench.opt.start_index
+   end_index = start_index + sysbench.opt.table_size - 1
+   if (sysbench.opt.fill_table_size > 0) then
+      end_index = start_index + sysbench.opt.fill_table_size - 1
+   end
+   con:query("SET SPANNER.AUTOCOMMIT_DML_MODE='PARTITIONED_NON_ATOMIC'")
+   con:query("SET SPANNER.COPY_MAX_PARALLELISM=20")
+   con:query("SET SPANNER.COPY_BATCH_SIZE=80000")
+   con:query("SET SPANNER.COPY_COMMIT_TIMEOUT=30000")
+   con:query("COPY sbtest".. table_num .." FROM STDIN")
+   for i = start_index, end_index do
 
       c_val = get_c_value()
       pad_val = get_pad_value()
@@ -222,15 +236,15 @@ CREATE TABLE sbtest%d(
                                sb_rand(1, sysbench.opt.table_size), c_val,
                                pad_val)
       else
-         query = string.format("(%d, %d, '%s', '%s')",
+        query = string.format("%d\t%d\t%s\t%s\n",
                                i, sb_rand(1, sysbench.opt.table_size), c_val,
                                pad_val)
       end
 
-      con:bulk_insert_next(query)
+      con:query(query)
    end
+   con:query("COPYEND")
 
-   con:bulk_insert_done()
 
    if sysbench.opt.create_secondary then
       print(string.format("Creating a secondary index on 'sbtest%d'...",
@@ -262,13 +276,13 @@ local stmt_defs = {
       t.INT},
    non_index_updates = {
       "UPDATE sbtest%u SET c=? WHERE id=?",
-      {t.CHAR, 120}, t.INT},
+      {t.VARCHAR, 120}, t.INT},
    deletes = {
       "DELETE FROM sbtest%u WHERE id=?",
       t.INT},
    inserts = {
       "INSERT INTO sbtest%u (id, k, c, pad) VALUES (?, ?, ?, ?)",
-      t.INT, t.INT, {t.CHAR, 120}, {t.CHAR, 60}},
+      t.INT, t.INT, {t.VARCHAR, 120}, {t.VARCHAR, 60}},
 }
 
 function prepare_begin()

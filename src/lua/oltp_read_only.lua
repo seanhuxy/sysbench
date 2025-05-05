@@ -38,6 +38,7 @@ function prepare_statements()
 end
 
 function event()
+   con:query("SET SPANNER.READONLY = true")
    if not sysbench.opt.skip_trx then
       begin()
    end

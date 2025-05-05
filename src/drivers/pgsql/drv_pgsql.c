@@ -68,6 +68,12 @@ typedef struct
   int              pg_type;
 } db_pgsql_bind_map_t;
 
+typedef struct
+{
+  PGconn *con;
+  int copy_mode;
+} wrapped_conn_t;
+
 /* DB-to-PgSQL bind types map */
 db_pgsql_bind_map_t db_pgsql_bind_map[] =
 {
@@ -156,7 +162,7 @@ static db_driver_t pgsql_driver =
 
 
 /* Local functions */
-
+static PGconn *pgconn_from_wrapped(void *wrapped);
 static int get_pgsql_bind_type(db_bind_type_t);
 static int get_unique_stmt_name(char *, int);
 
@@ -234,7 +240,7 @@ static void empty_notice_processor(void *arg, const char *msg)
 int pgsql_drv_connect(db_conn_t *sb_conn)
 {
   PGconn *con;
-
+  wrapped_conn_t *wrapped;
   con = PQsetdbLogin(args.host,
                      args.port,
                      NULL,
@@ -252,16 +258,29 @@ int pgsql_drv_connect(db_conn_t *sb_conn)
 
   /* Silence the default notice receiver spitting NOTICE message to stderr */
   PQsetNoticeProcessor(con, empty_notice_processor, NULL);
-  sb_conn->ptr = con;
+  wrapped = (wrapped_conn_t*) malloc(sizeof(wrapped_conn_t));
+  if (wrapped == NULL) {
+    log_text(LOG_FATAL, "Unable to allocate memory for wrapped_conn_t");
+    PQfinish(con);
+    return 1;
+  }
+
+  wrapped->con = con;
+  wrapped->copy_mode = 0;
+  sb_conn->ptr = wrapped;
   
   return 0;
 }
 
+PGconn *pgconn_from_wrapped(void *wrapped)
+{
+  return ((wrapped_conn_t *) wrapped)->con;
+}
 /* Disconnect from database */
 
 int pgsql_drv_disconnect(db_conn_t *sb_conn)
 {
-  PGconn *con = (PGconn *)sb_conn->ptr;
+  PGconn *con = pgconn_from_wrapped(sb_conn->ptr);
 
   /* These might be allocated in pgsql_check_status() */
   xfree(sb_conn->sql_state);
@@ -269,7 +288,7 @@ int pgsql_drv_disconnect(db_conn_t *sb_conn)
 
   if (con != NULL)
     PQfinish(con);
-
+  xfree(sb_conn->ptr);
   return 0;
 }
 
@@ -279,7 +298,7 @@ int pgsql_drv_disconnect(db_conn_t *sb_conn)
 
 int pgsql_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
 {
-  PGconn       *con = (PGconn *)stmt->connection->ptr;
+  PGconn       *con = pgconn_from_wrapped(stmt->connection->ptr);
   PGresult     *pgres;
   pg_stmt_t    *pgstmt;
   char         *buf = NULL;
@@ -391,7 +410,7 @@ int pgsql_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
 
 int pgsql_drv_bind_param(db_stmt_t *stmt, db_bind_t *params, size_t len)
 {
-  PGconn       *con = (PGconn *)stmt->connection->ptr;
+  PGconn       *con = pgconn_from_wrapped(stmt->connection->ptr);
   PGresult     *pgres;
   pg_stmt_t    *pgstmt;
   unsigned int i;
@@ -489,7 +508,7 @@ static db_error_t pgsql_check_status(db_conn_t *con, PGresult *pgres,
 {
   ExecStatusType status;
   db_error_t     rc;
-  PGconn * const pgcon = con->ptr;
+  PGconn * const pgcon = pgconn_from_wrapped(con->ptr);
 
   status = PQresultStatus(pgres);
   switch(status) {
@@ -501,7 +520,7 @@ static db_error_t pgsql_check_status(db_conn_t *con, PGresult *pgres,
     rc = DB_ERROR_NONE;
 
     break;
-
+  case PGRES_COPY_IN:
   case PGRES_COMMAND_OK:
     rs->nrows = strtoul(PQcmdTuples(pgres), NULL, 10);;
     rs->counter = (rs->nrows > 0) ? SB_CNT_WRITE : SB_CNT_OTHER;
@@ -571,7 +590,7 @@ static db_error_t pgsql_check_status(db_conn_t *con, PGresult *pgres,
 db_error_t pgsql_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 {
   db_conn_t       *con = stmt->connection;
-  PGconn          *pgcon = (PGconn *)con->ptr;
+  PGconn          *pgcon = pgconn_from_wrapped(con->ptr);
   PGresult        *pgres;
   pg_stmt_t       *pgstmt;
   char            *buf = NULL;
@@ -677,7 +696,9 @@ db_error_t pgsql_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 db_error_t pgsql_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
                            db_result_t *rs)
 {
-  PGconn         *pgcon = sb_conn->ptr;
+  PGconn         *pgcon = pgconn_from_wrapped(sb_conn->ptr);
+  wrapped_conn_t *wrapped = (wrapped_conn_t *) sb_conn->ptr;
+  int            copy_result;
   PGresult       *pgres;
   db_error_t     rc;
 
@@ -686,11 +707,44 @@ db_error_t pgsql_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
   sb_conn->sql_errno = 0;
   xfree(sb_conn->sql_state);
   xfree(sb_conn->sql_errmsg);
+  if (wrapped->copy_mode) {
+    if (strncmp("COPYEND", query, 8) == 0) {
+      copy_result = PQputCopyEnd(pgcon, NULL);
+      // Must call PG get result  https://postgrespro.com/list/thread-id/1780237
+      // This is blocking and will return when the insert is done.
+      PGresult *tmp;
+      tmp = PQgetResult(pgcon);
+      if (PQresultStatus(tmp) != PGRES_COMMAND_OK) {
+         log_text(LOG_FATAL, "Failed to copy %s", PQerrorMessage(pgcon));
+      }
 
+      if (copy_result == 1) {
+        wrapped->copy_mode = 0;
+      }
+      else {
+        log_text(LOG_FATAL, "COPY Failed");
+      }
+    } else {
+      copy_result = PQputCopyData(pgcon, query, len);
+    }
+    if (copy_result == 1) {
+      rs->nrows = 0;
+      rs->counter = SB_CNT_OTHER;
+      rc = DB_ERROR_NONE;
+    } else {
+      rs->counter = SB_CNT_ERROR;
+      log_text(LOG_FATAL, "Unexpected result %d during PQputCopy", copy_result);
+      rc = DB_ERROR_FATAL;
+    }
+  } else {
   pgres = PQexec(pgcon, query);
+    if (PQresultStatus(pgres) == PGRES_COPY_IN) {
+      wrapped->copy_mode = 1;
+    }
   rc = pgsql_check_status(sb_conn, pgres, "PQexec", query, rs);
 
   rs->ptr = (rs->counter == SB_CNT_READ) ? (void *) pgres : NULL;
+  }
 
   return rc;
 }
