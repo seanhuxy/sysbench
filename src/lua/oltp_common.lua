@@ -402,6 +402,7 @@ function cleanup()
    local con = drv:connect()
 
    for i = 1, sysbench.opt.tables do
+      con:query("DROP INDEX IF EXISTS k_" .. i)
       print(string.format("Dropping table 'sbtest%d'...", i))
       con:query("DROP TABLE IF EXISTS sbtest" .. i )
    end
