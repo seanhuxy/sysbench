@@ -992,7 +992,7 @@ void db_report_intermediate(sb_stat_t *stat)
   log_timestamp(LOG_NOTICE, stat->time_total,
                 "thds: %u tps: %4.2f "
                 "qps: %4.2f (r/w/o: %4.2f/%4.2f/%4.2f) "
-                "lat (ms,%u%%): %4.2f err/s: %4.2f "
+                "lat (ms,%u%%): %4.2f lat50: %4.2f lat95: %4.2f lat99: %4.2f err/s: %4.2f "
                 "reconn/s: %4.2f",
                 stat->threads_running,
                 stat->events / seconds,
@@ -1002,6 +1002,9 @@ void db_report_intermediate(sb_stat_t *stat)
                 stat->other / seconds,
                 sb_globals.percentile,
                 SEC2MS(stat->latency_pct),
+               SEC2MS(stat->latency_p50),
+               SEC2MS(stat->latency_p95),
+               SEC2MS(stat->latency_p99),
                 stat->errors / seconds,
                 stat->reconnects / seconds);
 

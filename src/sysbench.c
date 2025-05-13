@@ -181,11 +181,14 @@ static void sigalrm_thread_init_timeout_handler(int sig)
 void sb_report_intermediate(sb_stat_t *stat)
 {
   log_timestamp(LOG_NOTICE, stat->time_total,
-                "thds: %" PRIu32 " eps: %4.2f lat (ms,%u%%): %4.2f",
+                "thds: %" PRIu32 " eps: %4.2f late (ms,%u%%): %4.2f lat(ms, 50): %4.2f, lat(ms, 95): %4.2f, lat(ms, 99): %4.2f",
                 stat->threads_running,
                 stat->events / stat->time_interval,
                 sb_globals.percentile,
-                SEC2MS(stat->latency_pct));
+                SEC2MS(stat->latency_pct),
+               SEC2MS(stat->latency_p50),
+               SEC2MS(stat->latency_p95),
+               SEC2MS(stat->latency_p99));
   if (sb_globals.tx_rate > 0)
     log_timestamp(LOG_NOTICE, stat->time_total,
                   "queue length: %" PRIu64 " concurrency: %" PRIu64,
@@ -225,10 +228,19 @@ static void report_intermediate(void)
   sb_counters_agg_intermediate(cnt);
   report_get_common_stat(&stat, cnt);
 
+  double p50, p95, p99;
   stat.latency_pct =
-    MS2SEC(sb_histogram_get_pct_intermediate(&sb_latency_histogram,
-                                             sb_globals.percentile));
-
+    MS2SEC(sb_histogram_get_pct_intermediate_all(&sb_latency_histogram,
+                                             sb_globals.percentile, &p50, &p95, &p99));
+  stat.latency_p50 = MS2SEC(p50);
+  stat.latency_p95 = MS2SEC(p95);
+  stat.latency_p99 = MS2SEC(p99);
+  /*stat.latency_p50 =
+    MS2SEC(sb_histogram_get_pct_intermediate(&sb_latency_histogram, sb_globals.percentile));
+  stat.latency_p95 =
+    MS2SEC(sb_histogram_get_pct_intermediate(&sb_latency_histogram, 95.0));
+  stat.latency_p99 =
+    MS2SEC(sb_histogram_get_pct_intermediate(&sb_latency_histogram, 99.0));*/ 
   stat.time_interval = NS2SEC(sb_timer_current(&sb_intermediate_timer));
 
   if (sb_globals.tx_rate > 0)
@@ -295,11 +307,18 @@ void sb_report_cumulative(sb_stat_t *stat)
   log_text(LOG_NOTICE, "         max: %39.2f",
            SEC2MS(stat->latency_max));
 
-  if (sb_globals.percentile > 0)
+  if (sb_globals.percentile > 0) {
     log_text(LOG_NOTICE, "        %3dth percentile: %27.2f",
              sb_globals.percentile, SEC2MS(stat->latency_pct));
-  else
+    log_text(LOG_NOTICE, "        50th percentile: %27.2f",
+            SEC2MS(stat->latency_p50));
+    log_text(LOG_NOTICE, "        95th percentile: %27.2f",
+            SEC2MS(stat->latency_p95));
+    log_text(LOG_NOTICE, "        99th percentile: %27.2f",
+            SEC2MS(stat->latency_p99));
+  } else {
     log_text(LOG_NOTICE, "         percentile stats:               disabled");
+  }
 
   log_text(LOG_NOTICE, "         sum: %39.2f",
            SEC2MS(stat->latency_sum));
@@ -364,11 +383,17 @@ static void report_cumulative(void)
 
   sb_counters_agg_cumulative(cnt);
   report_get_common_stat(&stat, cnt);
-
+  double p50, p95, p99;
+  log_text(LOG_NOTICE, "Getting cumulative for all percentiles");
   stat.latency_pct =
-    MS2SEC(sb_histogram_get_pct_checkpoint(&sb_latency_histogram,
-                                           sb_globals.percentile));
-
+    MS2SEC(sb_histogram_get_pct_checkpoint_all(&sb_latency_histogram,
+                                           sb_globals.percentile, &p50, &p95, &p99));
+  stat.latency_p50 =
+    MS2SEC(p50);
+  stat.latency_p95 =
+    MS2SEC(p95);
+  stat.latency_p99 =
+    MS2SEC(p99);
   sb_timer_t t;
   sb_timer_init(&t);
 
