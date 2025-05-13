@@ -115,6 +115,107 @@ void sb_histogram_update(sb_histogram_t *h, double value)
   ck_pr_inc_64(&h->interm_slots[slot][i]);
 }
 
+double sb_histogram_get_pct_intermediate_all(sb_histogram_t *h,
+                                         double percentile, double *p50, double *p95, double *p99)
+{
+  size_t   i, s;
+  uint64_t nevents, ncur, nmax;
+  double   res;
+  uint64_t nmax_target, nmax_p50, nmax_p95, nmax_p99;
+  size_t idx_target, idx_p50, idx_p95, idx_p99;
+  
+  nevents = 0;
+
+  /*
+    This can be called concurrently with other sb_histogram_get_pct_*()
+    functions, so use the lock to protect shared structures. This will not block
+    sb_histogram_update() calls, but we make sure we don't lose any concurrent
+    increments by atomically fetching each array element and replacing it with
+    0.
+  */
+  pthread_rwlock_wrlock(&h->lock);
+
+  /*
+    Merge intermediate slots into temp_array.
+  */
+  const size_t size = h->array_size;
+  uint64_t * const array = h->temp_array;
+
+  for (i = 0; i < size; i++)
+  {
+    array[i] = ck_pr_fas_64(&h->interm_slots[0][i], 0);
+    nevents += array[i];
+  }
+
+  for (s = 1; s < SB_HISTOGRAM_NSLOTS; s++)
+  {
+    for (i = 0; i < size; i++)
+    {
+      uint64_t t;
+
+      t = ck_pr_fas_64(&h->interm_slots[s][i], 0);
+
+      array[i] += t;
+      nevents += t;
+    }
+  }
+
+  /*
+    Now that we have an aggregate 'snapshot' of current arrays and the total
+    number of events in it, calculate the current, intermediate percentile value
+    to return.
+  */
+  nmax_target = floor(nevents * percentile / 100 + 0.5);
+  nmax_p50 = floor(nevents * 50.0 / 100.0 + 0.5);
+  nmax_p95 = floor(nevents * 95.0 / 100.0 + 0.5);
+  nmax_p99 = floor(nevents * 99.0 / 100.0 + 0.5);
+
+  ncur = 0;
+  idx_target = 0; // Initialize to 0, in case nevents is 0 or target is 0
+  idx_p50 = 0;
+  idx_p95 = 0;
+  idx_p99 = 0;
+  
+  for (i = 0; i < size; i++)
+  {
+    ncur += array[i];
+    if (ncur >= nmax_target && idx_target == 0) {
+            idx_target = i;
+        }
+        if (ncur >= nmax_p50 && idx_p50 == 0) {
+            idx_p50 = i;
+        }
+        if (ncur >= nmax_p95 && idx_p95 == 0) {
+            idx_p95 = i;
+        }
+        if (ncur >= nmax_p99 && idx_p99 == 0) {
+            idx_p99 = i;
+        }
+
+        // Optimization: If all indices are found, we can break early
+        if (idx_target != 0 && idx_p50 != 0 && idx_p95 != 0 && idx_p99 != 0) {
+            break;
+        }
+  }
+
+  res = exp(idx_target / h->range_mult + h->range_deduct);
+  *p50 = exp(idx_p50 / h->range_mult + h->range_deduct);
+  *p95 = exp(idx_p95 / h->range_mult + h->range_deduct);
+  *p99 = exp(idx_p99 / h->range_mult + h->range_deduct);
+
+  /* Finally, add temp_array into accumulated values in cumulative_array. */
+  for (i = 0; i < size; i++)
+  {
+    h->cumulative_array[i] += array[i];
+  }
+
+  h->cumulative_nevents += nevents;
+
+  pthread_rwlock_unlock(&h->lock);
+
+  return res;
+}
+
 
 double sb_histogram_get_pct_intermediate(sb_histogram_t *h,
                                          double percentile)
@@ -263,6 +364,35 @@ double sb_histogram_get_pct_cumulative(sb_histogram_t *h, double percentile)
   return res;
 }
 
+double sb_histogram_get_pct_checkpoint_all(sb_histogram_t *h,
+                                       double percentile, double *p50, double *p95, double *p99)
+{
+  double   res;
+
+  /*
+    This can be called concurrently with other sb_histogram_get_pct_*()
+    functions, so use the lock to protect shared structures. This will not block
+    sb_histogram_update() calls, but we make sure we don't lose any concurrent
+    increments by atomically fetching each array element and replacing it with
+    0.
+  */
+  pthread_rwlock_wrlock(&h->lock);
+
+  merge_intermediate_into_cumulative(h);
+
+  res = get_pct_cumulative(h, percentile);
+  *p50 = get_pct_cumulative(h, 50.0);
+  *p95 = get_pct_cumulative(h, 95.0);
+  *p99 = get_pct_cumulative(h, 99.0);
+
+  /* Reset the cumulative array */
+  memset(h->cumulative_array, 0, h->array_size * sizeof(uint64_t));
+  h->cumulative_nevents = 0;
+
+  pthread_rwlock_unlock(&h->lock);
+
+  return res;
+}
 
 double sb_histogram_get_pct_checkpoint(sb_histogram_t *h,
                                        double percentile)

@@ -93,6 +93,10 @@ typedef struct {
 
   double   latency_pct;         /* Latency percentile */
 
+  double latency_p50; // To store calculated P50 latency
+  double latency_p95; // To store calculated P95 latency
+  double latency_p99; // To store calculated P99 latency
+
   double   latency_min;         /* Minimum latency (cumulative reports only) */
   double   latency_max;         /* Maximum latency (cumulative reports only) */
   double   latency_avg;         /* Average latency (cumulative reports only) */
